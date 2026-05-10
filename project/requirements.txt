@@ -1,0 +1,15 @@
+fastapi
+uvicorn[standard]
+kafka-python
+redis
+psycopg2-binary
+sqlalchemy
+pandas
+numpy
+scikit-learn
+tensorflow-cpu
+xgboost
+shap
+joblib
+python-dotenv
+websockets

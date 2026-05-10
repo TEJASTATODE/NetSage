@@ -1,43 +1,57 @@
 import pandas as pd
 from sklearn.model_selection import train_test_split
 from sklearn.preprocessing import StandardScaler
+from sklearn.metrics import (
+    precision_score, recall_score, f1_score,
+    accuracy_score, confusion_matrix, roc_auc_score
+)
 import numpy as np
 import tensorflow as tf
 from tensorflow.keras import Model
 from tensorflow.keras.layers import Input, Dense
 import matplotlib.pyplot as plt
+import joblib
 
+np.random.seed(42)
+tf.random.set_seed(42)
 
-
+# 📂 Load dataset
 df = pd.read_csv(
-    r"C:\Users\TEJAS\OneDrive\Desktop\IDS\project\data\UNSW-NB15_1_with_features.csv",
+    r"C:\Users\TEJAS\OneDrive\Desktop\PROJECTS\IDS\project\data\UNSW-NB15_1_with_features.csv",
     low_memory=False
 )
 
 print("Original shape:", df.shape)
 
-print("\nUnique Label values BEFORE cleaning:")
-print(df["Label"].value_counts())
-
+# 🧹 Clean label
 df["Label"] = pd.to_numeric(df["Label"], errors="coerce")
 
-print("\nUnique Label values AFTER conversion:")
+print("\nLabel distribution:")
 print(df["Label"].value_counts())
 
-
+# Split
 normal_df = df[df["Label"] == 0]
-attack_df=df[df["Label"]==1]
+attack_df = df[df["Label"] == 1]
 
+print("\nNormal shape:", normal_df.shape)
+print("Attack shape:", attack_df.shape)
 
-print("\nNormal-only shape:", normal_df.shape)
-print("\nAttack data shape (raw):", attack_df.shape)
-
+# ❌ Drop label
 normal_df = normal_df.drop(columns=["Label"])
 attack_df = attack_df.drop(columns=["Label"])
-print("\nFirst 3 rows of normal-only data:")
-print(normal_df.head(3))
 
+# 🔢 Keep numeric
+normal_df = normal_df.select_dtypes(include=["number"])
+attack_df = attack_df.select_dtypes(include=["number"])
 
+# 🛠 Handle missing
+normal_df = normal_df.fillna(0)
+attack_df = attack_df.fillna(0)
+
+# 🔒 Save columns
+columns = normal_df.columns.tolist()
+
+# Split train/val
 train_df, val_df = train_test_split(
     normal_df,
     test_size=0.2,
@@ -45,36 +59,29 @@ train_df, val_df = train_test_split(
     shuffle=True
 )
 
-train_df = train_df.select_dtypes(include=["number"])
-val_df = val_df.select_dtypes(include=["number"])
-attack_df = attack_df.select_dtypes(include=["number"])
+val_df = val_df.fillna(0)
 
 print("Train shape:", train_df.shape)
 print("Validation shape:", val_df.shape)
-print("Attack data shape (numeric only):", attack_df.shape)
 
-print("\nTrain sample:")
-print(train_df.head(2))
-
-print("\nValidation sample:")
-print(val_df.head(2))
-
+# ⚙️ Scaling
 scaler = StandardScaler()
 
-X_train_scaled = scaler.fit_transform(train_df)
-X_val_scaled = scaler.transform(val_df)
-X_attack_scaled = scaler.transform(attack_df)
+X_train = scaler.fit_transform(train_df)
+X_val = scaler.transform(val_df)
+X_attack = scaler.transform(attack_df)
 
-print("Scaled train shape:", X_train_scaled.shape)
-print("Scaled val shape:", X_val_scaled.shape)
-print("Scaled attack data shape:", X_attack_scaled.shape)
+# 🧠 Autoencoder
+input_dim = X_train.shape[1]
 
+input_layer = Input(shape=(input_dim,))
 
+encoded = Dense(64, activation="relu")(input_layer)
+encoded = Dense(32, activation="relu")(encoded)
 
-input_dim=X_train_scaled.shape[1]
-input_layer=Input(shape=(input_dim,))
-encoded = Dense(32, activation="relu")(input_layer)
-decoded = Dense(input_dim, activation="linear")(encoded)
+decoded = Dense(64, activation="relu")(encoded)
+decoded = Dense(input_dim, activation="linear")(decoded)
+
 autoencoder = Model(inputs=input_layer, outputs=decoded)
 
 autoencoder.compile(
@@ -82,94 +89,169 @@ autoencoder.compile(
     loss="mse"
 )
 
-
 autoencoder.summary()
 
+# ⏱ Training
 history = autoencoder.fit(
-    X_train_scaled,
-    X_train_scaled,
-    epochs=10,
+    X_train,
+    X_train,
+    epochs=30,
     batch_size=256,
-    validation_data=(X_val_scaled, X_val_scaled),
+    validation_data=(X_val, X_val),
     verbose=1
 )
 
-X_val_pred = autoencoder.predict(X_val_scaled)
-X_attack_pred = autoencoder.predict(X_attack_scaled)
+# 🔍 Predictions
+X_val_pred = autoencoder.predict(X_val)
+X_attack_pred = autoencoder.predict(X_attack)
 
-reconstruction_error = np.mean(
-    np.square(X_val_scaled - X_val_pred),
-    axis=1
-)
+# 📉 Reconstruction errors
+reconstruction_error = np.mean(np.square(X_val - X_val_pred), axis=1)
+attack_error = np.mean(np.square(X_attack - X_attack_pred), axis=1)
 
-print("\nReconstruction error stats:")
-print("Min:", reconstruction_error.min())
-print("Max:", reconstruction_error.max())
-print("Mean:", reconstruction_error.mean())
-print("Std:", reconstruction_error.std())
+print("\nValidation Error Mean:", reconstruction_error.mean())
+print("Attack Error Mean:", attack_error.mean())
 
-attack_error = np.mean(
-    np.square(X_attack_scaled - X_attack_pred),
-    axis=1
-)
-print("\nAttack reconstruction error stats:")
-print("Min:", attack_error.min())
-print("Mean:", attack_error.mean())
-print("Max:", attack_error.max())
+# =========================================================
+# 🚀 DYNAMIC THRESHOLD (MOVING WINDOW)
+# =========================================================
+
+window_size = 5000
+percentile = 98
+
+dynamic_thresholds = []
+
+initial_threshold = np.percentile(reconstruction_error, percentile)
+
+for i in range(len(reconstruction_error)):
+    if i < window_size:
+        dynamic_thresholds.append(initial_threshold)
+    else:
+        window = reconstruction_error[i-window_size:i]
+        t = np.percentile(window, percentile)
+        dynamic_thresholds.append(t)
+
+dynamic_thresholds = np.array(dynamic_thresholds)
+
+# Final threshold (latest)
+final_threshold = dynamic_thresholds[-1]
+
+# =========================================================
+# 🚨 PREDICTIONS
+# =========================================================
+
+y_pred_normal = (reconstruction_error > dynamic_thresholds).astype(int)
+y_pred_attack = (attack_error > final_threshold).astype(int)
+
+# Ground truth
+y_true = np.concatenate([
+    np.zeros(len(reconstruction_error)),
+    np.ones(len(attack_error))
+])
+
+y_pred = np.concatenate([y_pred_normal, y_pred_attack])
 
 
-threshold = np.percentile(reconstruction_error, 99.5)
-print("Anomaly threshold (99.5 percentile):", threshold)
-attack_flags = attack_error > threshold
-detected = attack_flags.sum()
-total = len(attack_flags)
-print(f"\nDetected attacks: {detected} / {total}")
-print(f"Attack detection rate: {(detected/total)*100:.2f}%")
+# =========================================================
+# 🔍 FEATURE-LEVEL ERROR ANALYSIS
+# =========================================================
 
-if attack_flags.any():
-    idx = np.where(attack_flags)[0][0]
-    print("\n Anomaly feature wise:")
-    print("Reconstruction Error:", attack_error[idx])
-    diff = abs(X_attack_scaled[idx] - X_attack_pred[idx])
-    diff_df = pd.DataFrame({
-        "feature": attack_df.columns,
-        "error": diff
-    })
-    diff_df = diff_df.sort_values(by="error", ascending=False)
-    print("\nTop features causing anomaly:")
-    print(diff_df.head(5))
+# Per-feature reconstruction error
+val_feature_error = np.square(X_val - X_val_pred)
+attack_feature_error = np.square(X_attack - X_attack_pred)
 
-else:
-    print("\nNo anomalies detected to explain.")
+# Mean error per feature
+val_feature_mean = val_feature_error.mean(axis=0)
+attack_feature_mean = attack_feature_error.mean(axis=0)
 
-# visuals for undertsnading
+feature_importance_df = pd.DataFrame({
+    "feature": columns,
+    "normal_error": val_feature_mean,
+    "attack_error": attack_feature_mean,
+    "difference": attack_feature_mean - val_feature_mean
+}).sort_values(by="difference", ascending=False)
+
+print("\n🔥 Top Features Causing Anomalies:")
+print(feature_importance_df.head(10))
+
+# =========================================================
+# 📊 METRICS
+# =========================================================
+
+
+precision = precision_score(y_true, y_pred)
+recall = recall_score(y_true, y_pred)
+f1 = f1_score(y_true, y_pred)
+accuracy = accuracy_score(y_true, y_pred)
+cm = confusion_matrix(y_true, y_pred)
+
+print("\n📊 MODEL PERFORMANCE")
+print(f"Accuracy : {accuracy:.4f}")
+print(f"Precision: {precision:.4f}")
+print(f"Recall   : {recall:.4f}")
+print(f"F1 Score : {f1:.4f}")
+
+print("\nConfusion Matrix:")
+print(cm)
+
+tn, fp, fn, tp = cm.ravel()
+
+print(f"\nTP: {tp}")
+print(f"FP: {fp}")
+print(f"FN: {fn}")
+print(f"TN: {tn}")
+
+# =========================================================
+# 🚨 DETECTION RATE (IMPORTANT FOR IDS)
+# =========================================================
+
+detection_rate = (tp / (tp + fn)) * 100
+
+print(f"\n Detection Rate: {detection_rate:.2f}%")
+
+# =========================================================
+# 📈 ROC-AUC
+# =========================================================
+
+scores = np.concatenate([reconstruction_error, attack_error])
+roc_auc = roc_auc_score(y_true, scores)
+
+print(f"\nROC-AUC Score: {roc_auc:.4f}")
+
+
+autoencoder.save("model.keras")
+joblib.dump(scaler, "scaler.pkl")
+joblib.dump(columns, "columns.pkl")
+
+joblib.dump({
+    "window_size": window_size,
+    "percentile": percentile,
+    "initial_threshold": float(initial_threshold)
+}, "threshold_config.pkl")
+
+print("\n✅ All artifacts saved successfully!")
+
+# =========================================================
+# 📊 VISUALIZATION
+# =========================================================
+
 plt.figure(figsize=(10, 5))
 
-plt.hist(reconstruction_error, bins=100, alpha=0.6,
-         label="Normal Traffic", color="green")
+plt.hist(reconstruction_error, bins=100, alpha=0.6, label="Normal")
+plt.hist(attack_error, bins=100, alpha=0.6, label="Attack")
 
-plt.hist(attack_error, bins=100, alpha=0.6,
-         label="Attack Traffic", color="red")
+plt.axvline(final_threshold, linestyle="--", label="Threshold")
 
-plt.axvline(threshold, color="black", linestyle="--",
-            label="Anomaly Threshold")
-
-plt.xlabel("Reconstruction Error")
-plt.ylabel("Frequency")
-plt.title("Reconstruction Error Distribution (Normal vs Attack)")
 plt.legend()
-plt.tight_layout()
+plt.title("Error Distribution")
 plt.show()
 
-# train visuals
-plt.figure(figsize=(8, 4))
+# Training curve
+plt.figure()
 
-plt.plot(history.history["loss"], label="Training Loss")
-plt.plot(history.history["val_loss"], label="Validation Loss")
+plt.plot(history.history["loss"], label="Train Loss")
+plt.plot(history.history["val_loss"], label="Val Loss")
 
-plt.xlabel("Epoch")
-plt.ylabel("MSE Loss")
-plt.title("Autoencoder Training Curve")
 plt.legend()
-plt.tight_layout()
+plt.title("Training Curve")
 plt.show()
